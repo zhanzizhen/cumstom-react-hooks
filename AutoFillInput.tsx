@@ -1,4 +1,3 @@
-```ts
 import React, { useEffect, useRef, useCallback } from "react";
 import { createCx } from "utils";
 import { prefix } from "./AutoFillInput.scss";
@@ -360,4 +359,4 @@ const AutoFillInput = AutoFillInputCreator(false);
 const AutoFillSearch = AutoFillInputCreator(true);
 
 export { AutoFillSearch, AutoFillInput, NameSpaceMap };
-```
+
