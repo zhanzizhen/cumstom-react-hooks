@@ -4,29 +4,34 @@ import {
   SorterResult,
   TableRowSelection,
 } from "antd/lib/table";
+import useRefState from "./useRefState";
+import useRefProp from "./useRefProp";
 
-type serverFunction<T> = (
-  pagination: PaginationConfig | boolean,
-  filters?: Record<keyof T, string[]>,
-  sorter?: SorterResult<T>
-) => Promise<{
+type OrderBy = number | string;
+export type ServerFunction<T> = (p: {
+  pagination: PaginationConfig | boolean;
+  filters?: Record<keyof T, string[]>;
+  sorter?: SorterResult<T>;
+
+  params: {
+    offset: number;
+    limit: number;
+    sort?: OrderBy;
+    orderBy?: OrderBy;
+    orderDirection?: "DESC" | "ASC";
+  };
+}) => Promise<{
   list: T[];
   totalSize?: number;
 }>;
-/**一个antd-table的hooks，目的是减少一些重复工作，加快开发速度 */
-export function useTable<T extends Object>({
-  server,
-  pageSize: initalPageSize,
-  rowKey,
-  rowSelection,
-  hasLoading,
-}: {
+interface ConfigType<T extends Object> {
   /**
    * 请求数据的接口 ,
    * 约定好返回格式是{list: item[],totalSize:number}，
-   * 如果后端数据不是如此，需要使用者转换一下
+   * 如果后端数据不是如此，需要使用者转换一下。
+   * useTable reload data的时机就是server的值发生改变的时候，所以一般server都是由useCallback包裹的
    */
-  server: serverFunction<T>;
+  server: ServerFunction<T>;
   /**可选，默认为10 */
   pageSize?: number;
   rowKey: keyof T & (string | number);
@@ -34,15 +39,43 @@ export function useTable<T extends Object>({
   rowSelection?: Partial<TableRowSelection<T>>;
   /**是否开启Table的loading，默认不开启。因为后台管理是内网，速度够快 */
   hasLoading?: boolean;
-}) {
+  /**排序的字典，目的是为了自动生成排序参数 */
+  sorterDic?: { [key in keyof T]?: OrderBy };
+  /**后端接口的排序功能分两种：
+   * 一种是orderBy+orderDirection ，支持双向排序（默认）；
+   * 另一种是sort字段，只支持向下排序，需要手动在css隐藏.ant-table-column-sorter-up
+   * */
+  sortType?: "order" | "sort";
+  /**是否支持跨页多选 */
+  multiplyPageSelect?: boolean;
+}
+/**一个antd-table的hooks，目的是减少一些重复工作，加快开发速度 */
+export function useTable<T extends Object>({
+  server,
+  pageSize: INITIAL_PAGESIZE = 10,
+  rowKey,
+  rowSelection,
+  hasLoading,
+  sorterDic,
+  sortType,
+  multiplyPageSelect,
+}: ConfigType<T>) {
   const [current, setCurrent] = useState(1);
-  const [pageSize, setPageSize] = useState(initalPageSize || 10);
+  const [pageSize, setPageSize] = useState(INITIAL_PAGESIZE);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [dataSource, setDatasource] = useState<T[]>([]);
+  const [, sortRef, setSorter] = useRefState<SorterResult<T> | undefined>(
+    undefined
+  );
+  const [, filterRef, setFilter] = useRefState<
+    Record<keyof T, string[]> | undefined
+  >(undefined);
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[] | number[]>(
     []
   );
+  /**用useRefProp确保sorterDic的值的改变不会影响逻辑 */
+  const sorterDicRef = useRefProp(sorterDic);
 
   const serverV2 = useCallback(
     (
@@ -50,8 +83,38 @@ export function useTable<T extends Object>({
       filters?: Record<keyof T, string[]>,
       sorter?: SorterResult<T>
     ) => {
+      /**根据接口规律，自动生成请求参数 */
+      function generateParams() {
+        let params: Parameters<ServerFunction<T>>[0]["params"] = {
+          offset: 0,
+          limit: pageSize,
+        };
+        if (typeof pagination !== "boolean") {
+          const { current = 1 } = pagination;
+          params.offset = (current - 1) * pageSize;
+        }
+        if (sorter && sorterDicRef.current) {
+          if (sorterDicRef.current[sorter.field as keyof T] !== undefined) {
+            const value = sorterDicRef.current[sorter.field as keyof T];
+            if (sortType === "sort") {
+              params.sort = value;
+            } else {
+              params.orderBy = value;
+              params.orderDirection =
+                sorter.order === "ascend" ? "ASC" : "DESC";
+            }
+          }
+        }
+        return params;
+      }
+      if (sorter) {
+        setSorter(sorter);
+      }
+      if (filters) {
+        setFilter(filters);
+      }
       setLoading(true);
-      server(pagination, filters, sorter).then(
+      server({ pagination, filters, sorter, params: generateParams() }).then(
         ({ list = [], totalSize: resTotal }) => {
           setLoading(false);
           setDatasource(list);
@@ -59,7 +122,7 @@ export function useTable<T extends Object>({
         }
       );
     },
-    [server]
+    [pageSize, server, setFilter, setSorter, sortType, sorterDicRef]
   );
 
   /* 跳页、过滤、排序 */
@@ -73,12 +136,12 @@ export function useTable<T extends Object>({
         setCurrent(pagination.current || 1);
         setPageSize(pagination.pageSize || pageSize);
       }
-      if (rowSelection) {
+      if (rowSelection && !multiplyPageSelect) {
         setSelectedRowKeys([]);
       }
       serverV2(pagination, filters, sorter);
     },
-    [pageSize, rowSelection, serverV2]
+    [multiplyPageSelect, pageSize, rowSelection, serverV2]
   );
 
   /**提供一个让外界主动刷新列表的api */
@@ -109,9 +172,10 @@ export function useTable<T extends Object>({
   }, [rowSelection, selectedRowKeys]);
 
   useEffect(() => {
-    serverV2({ current: 1, pageSize });
-    /* 当server或pageSize变化的时候，会重新去请求数据 */
-  }, [pageSize, serverV2]);
+    setCurrent(1);
+    serverV2({ current: 1, pageSize }, filterRef.current, sortRef.current);
+    /* 当server(filterData)或pageSize变化的时候，会重新去请求数据 */
+  }, [filterRef, pageSize, serverV2, sortRef]);
 
   return {
     /**antd-table的props，直接放在<Table />上 */
@@ -129,5 +193,6 @@ export function useTable<T extends Object>({
     },
     reloadTable,
     setDatasource,
+    setSelectedRowKeys,
   };
 }
